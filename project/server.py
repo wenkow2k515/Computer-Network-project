@@ -52,14 +52,14 @@ def handle_two_player_game(player1_conn, player2_conn):
                 p2_name = [k for k, v in player_sessions.items() if v == player2_conn][0]
 
                 # init the board for each player(or reconnect)
-                board1 = None
-                board2 = None
+                board1 = Board(BOARD_SIZE)
+                board2 = Board(BOARD_SIZE)
                 if p1_name in disconnected:
                     board1 = disconnected[p1_name]["board"]
-                    print(board1)
+                    print(board1.hidden_grid)
                 if p2_name in disconnected:
                     board2 = disconnected[p2_name]["board"]
-                    print(board1)
+                    print(board2.hidden_grid)
 
                 # clear the disconnected state
                 if p1_name in disconnected: del disconnected[p1_name]
@@ -68,7 +68,7 @@ def handle_two_player_game(player1_conn, player2_conn):
             while not game_restart_event.is_set():
                 try:
                     with (player1_conn, player2_conn):
-                        run_two_player_game(rfile1, wfile1, rfile2, wfile2, spectators, board1, board2)
+                        board1, board2 = run_two_player_game(rfile1, wfile1, rfile2, wfile2, spectators, board1, board2)
 
                         # ask players if they want to play again
                         send(wfile1, "GAME_OVER Play again? (Y/N)")
@@ -95,8 +95,6 @@ def handle_two_player_game(player1_conn, player2_conn):
                                 "disconnect_time": time.time(),
                                 "game_state": "IN_PROGRESS"
                             }
-                    print(board1)
-                    print(board2)
                     break
 
         finally:
