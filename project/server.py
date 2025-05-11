@@ -10,11 +10,11 @@ The core issue is in how the client handles incoming messages.
 However, if you want to support multiple clients (i.e. progress through further Tiers), you'll need concurrency here too.
 """
 
-import socket, threading, time
+import socket, threading, time, protocol
 
 from matplotlib.pyplot import disconnect
-
-from battleship import run_two_player_game, Board, BOARD_SIZE
+from protocol import sessions
+from battleship import run_two_player_game, Board, BOARD_SIZE, ClientSession
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -25,24 +25,11 @@ player_sessions = {}  # {username: {"conn": conn, "board": Board, "opponent_boar
 disconnected = {}  # {username: {"conn": conn, "board": Board, "opponent_board": Board, "game_state": str, "disconnect_time": float}}
 sessions_lock = threading.Lock()
 
-def recv(rfile):
-    line = rfile.readline().strip()
-    if not line:  # if client disconnected, raise an exception
-        raise ConnectionError("Client disconnected")
-    return line
-
-def send(wfile, msg):
-    wfile.write(msg + '\n')
-    wfile.flush()
-
-
 def handle_two_player_game(player1_conn, player2_conn):
-    global spectators
+    global spectators, current_player
     game_restart_event = threading.Event()
-    wfile1 = player1_conn.makefile('w')
-    wfile2 = player2_conn.makefile('w')
-    rfile1 = player1_conn.makefile('r')
-    rfile2 = player2_conn.makefile('r')
+    session1 = sessions[player1_conn]
+    session2 = sessions[player2_conn]
 
     def game_session():
         nonlocal player1_conn, player2_conn
@@ -54,12 +41,13 @@ def handle_two_player_game(player1_conn, player2_conn):
                 # init the board for each player(or reconnect)
                 board1 = Board(BOARD_SIZE)
                 board2 = Board(BOARD_SIZE)
+                init_current_player = 1
                 if p1_name in disconnected:
                     board1 = disconnected[p1_name]["board"]
-                    print(board1.hidden_grid)
+                    init_current_player = disconnected[p1_name].get("current_player", 1)
                 if p2_name in disconnected:
                     board2 = disconnected[p2_name]["board"]
-                    print(board2.hidden_grid)
+                    init_current_player = disconnected[p2_name].get("current_player", 2)
 
                 # clear the disconnected state
                 if p1_name in disconnected: del disconnected[p1_name]
@@ -68,13 +56,13 @@ def handle_two_player_game(player1_conn, player2_conn):
             while not game_restart_event.is_set():
                 try:
                     with (player1_conn, player2_conn):
-                        board1, board2 = run_two_player_game(rfile1, wfile1, rfile2, wfile2, spectators, board1, board2)
+                        board1, board2, current_player = run_two_player_game(session1, session2, spectators, board1, board2, init_current_player)
 
                         # ask players if they want to play again
-                        send(wfile1, "GAME_OVER Play again? (Y/N)")
-                        send(wfile2, "GAME_OVER Play again? (Y/N)")
-                        response1 = recv(rfile1).strip().upper()
-                        response2 = recv(rfile2).strip().upper()
+                        session1.send("GAME_OVER Play again? (Y/N)", use_client_seq=False)
+                        session2.send("GAME_OVER Play again? (Y/N)", use_client_seq=False)
+                        response1 = session1.recv().strip().upper()
+                        response2 = session2.recv().strip().upper()
 
                         if response1 != 'Y' or response2 != 'Y':
                             break
@@ -89,10 +77,11 @@ def handle_two_player_game(player1_conn, player2_conn):
                     with sessions_lock:
                         for name in [p1_name, p2_name]:
                             disconnected[name] = {
-                                "conn": player_sessions[name],
+                                "session": sessions[player_sessions[name]],
                                 "board": board1 if name == p1_name else board2,
                                 "opponent_board": board2 if name == p1_name else board1,
                                 "disconnect_time": time.time(),
+                                "current_player": current_player,
                                 "game_state": "IN_PROGRESS"
                             }
                     break
@@ -106,20 +95,24 @@ def handle_two_player_game(player1_conn, player2_conn):
                 except ValueError:
                     pass
 
-                # spectators list
+                with sessions_lock:
+                    timeout = 60
+                    pending_reconnects = sum(
+                        1 for v in disconnected.values() if time.time() - v["disconnect_time"] <= timeout)
+
                 new_players = []
-                while len(active_players) < 2 and spectators:
-                    spectator_conn = spectators.pop(0)
-                    try:
-                        wfile = spectator_conn.makefile('w')
-                        wfile.write("PING\n")
-                        wfile.flush()
-                        active_players.append(spectator_conn)
-                        new_players.append(spectator_conn)
-                        send(wfile, "ROLE PLAYER")
-                        print(f"[INFO] the spectator promote to player: {spectator_conn.getpeername()}")
-                    except (ConnectionResetError, BrokenPipeError):
-                        continue
+                if pending_reconnects == 0:
+                    while len(active_players) < 2 and spectators:
+                        spectator_conn = spectators.pop(0)
+                        try:
+                            session_sp = sessions[spectator_conn]
+                            session_sp.send("PING\n")
+                            active_players.append(spectator_conn)
+                            new_players.append(spectator_conn)
+                            session_sp.send("ROLE PLAYER")
+                            print(f"[INFO] the spectator promote to player: {spectator_conn.getpeername()}")
+                        except (ConnectionResetError, BrokenPipeError):
+                            continue
 
                 if len(new_players) == 2:
                     game_restart_event.set()
@@ -132,28 +125,14 @@ def handle_two_player_game(player1_conn, player2_conn):
     game_thread = threading.Thread(target=game_session)
     game_thread.start()
 
-    # # connection monitor
-    # def connection_monitor():
-    #     while game_thread.is_alive():
-    #         time.sleep(1)
-    #         try:
-    #             player1_conn.send(b'')
-    #             player2_conn.send(b'')
-    #         except (BrokenPipeError, ConnectionResetError):
-    #             game_thread.join(0.1)
-    #             break
-    #
-    # monitor_thread = threading.Thread(target=connection_monitor)
-    # monitor_thread.start()
-
 def handle_client(conn, addr):
     global active_players, spectators, players_lock, disconnected
     print(f"[INFO] Client connected from {addr}")
+    session = ClientSession(conn)
+    sessions[conn] = session
 
     try:
-        rfile = conn.makefile('r')
-        wfile = conn.makefile('w')
-        first_line = rfile.readline().strip()
+        first_line = session.recv()
 
         if not first_line.startswith("USER "):
             conn.close()
@@ -191,9 +170,7 @@ def handle_client(conn, addr):
         with players_lock:
             if len(active_players) < 2:
                 active_players.append(conn)
-                wfile = conn.makefile('w')
-                wfile.write("ROLE PLAYER\n")
-                wfile.flush()
+                session.send("ROLE PLAYER\n")
                 print("[INFO] Player added to active players list")
                 # check if we have two players
                 if len(active_players) == 2:
@@ -202,9 +179,7 @@ def handle_client(conn, addr):
                     game_thread.start()
             else:
                 spectators.append(conn)
-                wfile = conn.makefile('w')
-                wfile.write("ROLE SPECTATOR\n")
-                wfile.flush()
+                session.send("ROLE SPECTATOR\n")
                 print("[INFO] Client added to spectators list")
     except Exception as e:
         print(f"[ERROR] error in client handling: {e}")
