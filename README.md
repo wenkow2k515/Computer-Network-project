@@ -8,7 +8,6 @@
 - [Gameplay Instructions](#gameplay-instructions)
 - [Features Demonstrated](#features-demonstrated)
 - [Troubleshooting](#troubleshooting)
-- [Contact](#contact)
 
 ---
 
