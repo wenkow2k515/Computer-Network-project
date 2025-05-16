@@ -8,6 +8,7 @@ Contains core data structures and logic for Battleship, including:
 
 """
 
+import queue
 import random, threading, time, protocol
 from protocol import sessions
 
@@ -17,15 +18,17 @@ SHIPS = [
     ("Battleship", 4),
     ("Cruiser", 3),
     ("Submarine", 3),
-    ("Destroyer", 2)
+    ("Destroyer", 2),
 ]
+
 
 class ClientSession:
     def __init__(self, conn):
         self.conn = conn
-        self.client_seq = 0     # the client's sequence number
-        self.server_seq = 0     # the server's sequence number
+        self.client_seq = 0  # the client's sequence number
+        self.server_seq = 0  # the server's sequence number
         self.lock = threading.Lock()
+        self.recv_buffer = queue.Queue()
 
     def get_next_server_seq(self):
         """generate the next server sequence number"""
@@ -36,17 +39,24 @@ class ClientSession:
     def send(self, data: str, ptype=protocol.PacketType.DATA, use_client_seq=False):
         """send the data packet to the client"""
         seq = self.client_seq if use_client_seq else self.get_next_server_seq()
-        protocol.send_packet(self.conn, protocol.Packet(
-            seq_num=seq,
-            ptype=ptype,
-            data=data.encode('utf-8')
-        ))
+        try:
+            protocol.send_packet(
+                self.conn,
+                protocol.Packet(sequence_number=seq, ptype=ptype, data=data.encode("utf-8")),
+            )
+        except OSError as e:
+            print(f"[ERROR] send failed: {e}")
+            raise ConnectionResetError("Client disconnected")
 
     def recv(self):
-        """receive the data packet from the client"""
-        packet = protocol.recv_packet(self.conn)
-        self.client_seq = packet.seq_num  # update the client sequence number
-        return packet.data.decode('utf-8')
+        try:
+            packet = protocol.recv_packet(self.conn)
+            self.client_seq = packet.sequence_number
+            return packet.data.decode("utf-8")
+        except Exception as e:
+            print(f"[ERROR] ClientSession.recv error: {e}")
+            return None
+
 
 class Board:
     """
@@ -70,15 +80,17 @@ class Board:
     def __init__(self, size=BOARD_SIZE):
         self.size = size
         # '.' for empty water
-        self.hidden_grid = [['.' for _ in range(size)] for _ in range(size)]
+        self.hidden_grid = [["." for _ in range(size)] for _ in range(size)]
         # display_grid is what the player or an observer sees (no 'S')
-        self.display_grid = [['.' for _ in range(size)] for _ in range(size)]
-        self.placed_ships = []  # e.g. [{'name': 'Destroyer', 'positions': {(r, c), ...}}, ...]
+        self.display_grid = [["." for _ in range(size)] for _ in range(size)]
+        self.placed_ships = (
+            []
+        )  # e.g. [{'name': 'Destroyer', 'positions': {(r, c), ...}}, ...]
 
     def reset(self):
         """reset the board to its initial state"""
-        self.hidden_grid = [['.' for _ in range(self.size)] for _ in range(self.size)]
-        self.display_grid = [['.' for _ in range(self.size)] for _ in range(self.size)]
+        self.hidden_grid = [["." for _ in range(self.size)] for _ in range(self.size)]
+        self.display_grid = [["." for _ in range(self.size)] for _ in range(self.size)]
         self.placed_ships = []
 
     def place_ships_randomly(self, ships=SHIPS):
@@ -96,13 +108,13 @@ class Board:
                 col = random.randint(0, self.size - 1)
 
                 if self.can_place_ship(row, col, ship_size, orientation):
-                    occupied_positions = self.do_place_ship(row, col, ship_size, orientation)
-                    self.placed_ships.append({
-                        'name': ship_name,
-                        'positions': occupied_positions
-                    })
+                    occupied_positions = self.do_place_ship(
+                        row, col, ship_size, orientation
+                    )
+                    self.placed_ships.append(
+                        {"name": ship_name, "positions": occupied_positions}
+                    )
                     placed = True
-
 
     def place_ships_manually(self, ships=SHIPS):
         """
@@ -115,7 +127,11 @@ class Board:
                 self.print_display_grid(show_hidden_board=True)
                 print(f"\nPlacing your {ship_name} (size {ship_size}).")
                 coord_str = input("  Enter starting coordinate (e.g. A1): ").strip()
-                orientation_str = input("  Orientation? Enter 'H' (horizontal) or 'V' (vertical): ").strip().upper()
+                orientation_str = (
+                    input("  Orientation? Enter 'H' (horizontal) or 'V' (vertical): ")
+                    .strip()
+                    .upper()
+                )
 
                 try:
                     row, col = parse_coordinate(coord_str)
@@ -124,9 +140,9 @@ class Board:
                     continue
 
                 # Convert orientation_str to 0 (horizontal) or 1 (vertical)
-                if orientation_str == 'H':
+                if orientation_str == "H":
                     orientation = 0
-                elif orientation_str == 'V':
+                elif orientation_str == "V":
                     orientation = 1
                 else:
                     print("  [!] Invalid orientation. Please enter 'H' or 'V'.")
@@ -134,33 +150,42 @@ class Board:
 
                 # Check if we can place the ship
                 if self.can_place_ship(row, col, ship_size, orientation):
-                    occupied_positions = self.do_place_ship(row, col, ship_size, orientation)
-                    self.placed_ships.append({
-                        'name': ship_name,
-                        'positions': occupied_positions
-                    })
+                    occupied_positions = self.do_place_ship(
+                        row, col, ship_size, orientation
+                    )
+                    self.placed_ships.append(
+                        {"name": ship_name, "positions": occupied_positions}
+                    )
                     break
                 else:
-                    print(f"  [!] Cannot place {ship_name} at {coord_str} (orientation={orientation_str}). Try again.")
-
+                    print(
+                        f"  [!] Cannot place {ship_name} at {coord_str} (orientation={orientation_str}). Try again."
+                    )
 
     def can_place_ship(self, row, col, ship_size, orientation):
         """
-        Check if we can place a ship of length 'ship_size' at (row, col)
-        with the given orientation (0 => horizontal, 1 => vertical).
-        Returns True if the space is free, False otherwise.
+        Check if a ship can be placed at the given position and orientation.
+
+        Args:
+            row (int): Starting row index.
+            col (int): Starting column index.
+            ship_size (int): Length of the ship.
+            orientation (int): 0 for horizontal, 1 for vertical.
+
+        Returns:
+            bool: True if the ship can be placed, False otherwise.
         """
         if orientation == 0:  # Horizontal
             if col + ship_size > self.size:
                 return False
             for c in range(col, col + ship_size):
-                if self.hidden_grid[row][c] != '.':
+                if self.hidden_grid[row][c] != ".":
                     return False
         else:  # Vertical
             if row + ship_size > self.size:
                 return False
             for r in range(row, row + ship_size):
-                if self.hidden_grid[r][col] != '.':
+                if self.hidden_grid[r][col] != ".":
                     return False
         return True
 
@@ -171,11 +196,11 @@ class Board:
         occupied = set()
         if orientation == 0:  # Horizontal
             for c in range(col, col + ship_size):
-                self.hidden_grid[row][c] = 'S'
+                self.hidden_grid[row][c] = "S"
                 occupied.add((row, c))
         else:  # Vertical
             for r in range(row, row + ship_size):
-                self.hidden_grid[r][col] = 'S'
+                self.hidden_grid[r][col] = "S"
                 occupied.add((r, col))
         return occupied
 
@@ -191,38 +216,48 @@ class Board:
         The server can use this result to inform the firing player.
         """
         cell = self.hidden_grid[row][col]
-        if cell == 'S':
+        if cell == "S":
             # Mark a hit
-            self.hidden_grid[row][col] = 'X'
-            self.display_grid[row][col] = 'X'
+            self.hidden_grid[row][col] = "X"
+            self.display_grid[row][col] = "X"
             # Check if that hit sank a ship
             sunk_ship_name = self._mark_hit_and_check_sunk(row, col)
             if sunk_ship_name:
-                return ('hit', sunk_ship_name)  # A ship has just been sunk
+                return ("hit", sunk_ship_name)  # A ship has just been sunk
             else:
-                return ('hit', None)
-        elif cell == '.':
+                return ("hit", None)
+        elif cell == ".":
             # Mark a miss
-            self.hidden_grid[row][col] = 'o'
-            self.display_grid[row][col] = 'o'
-            return ('miss', None)
-        elif cell == 'X' or cell == 'o':
-            return ('already_shot', None)
+            self.hidden_grid[row][col] = "o"
+            self.display_grid[row][col] = "o"
+            return ("miss", None)
+        elif cell == "X" or cell == "o":
+            return ("already_shot", None)
         else:
             # In principle, this branch shouldn't happen if 'S', '.', 'X', 'o' are all possibilities
-            return ('already_shot', None)
+            return ("already_shot", None)
 
     def _mark_hit_and_check_sunk(self, row, col):
         """
-        Remove (row, col) from the relevant ship's positions.
-        If that ship's positions become empty, return the ship name (it's sunk).
-        Otherwise return None.
+        Check if a hit at (row, col) causes a ship to sink.
+
+        Args:
+            row (int): Row index of the hit.
+            col (int): Column index of the hit.
+
+        Returns:
+            str or None: The name of the sunk ship if it is fully destroyed, otherwise None.
+
+        Logic:
+            - Iterate through all placed ships.
+            - If the hit position belongs to a ship, remove it from the ship's positions.
+            - If the ship's positions are empty, it is considered sunk.
         """
         for ship in self.placed_ships:
-            if (row, col) in ship['positions']:
-                ship['positions'].remove((row, col))
-                if len(ship['positions']) == 0:
-                    return ship['name']
+            if (row, col) in ship["positions"]:
+                ship["positions"].remove((row, col))
+                if len(ship["positions"]) == 0:
+                    return ship["name"]
                 break
         return None
 
@@ -231,7 +266,7 @@ class Board:
         Check if all ships are sunk (i.e. every ship's positions are empty).
         """
         for ship in self.placed_ships:
-            if len(ship['positions']) > 0:
+            if len(ship["positions"]) > 0:
                 return False
         return True
 
@@ -257,7 +292,7 @@ class Board:
         print("  " + "".join(str(i + 1).rjust(2) for i in range(self.size)))
         # Each row labeled with A, B, C, ...
         for r in range(self.size):
-            row_label = chr(ord('A') + r)
+            row_label = chr(ord("A") + r)
             row_str = " ".join(grid_to_print[r][c] for c in range(self.size))
             print(f"{row_label:2} {row_str}")
 
@@ -277,45 +312,78 @@ def parse_coordinate(coord_str):
     col_digits = coord_str[1:]
     if not col_digits.isdigit():
         raise ValueError("col must be the number（1-10）")
-    row = ord(row_letter) - ord('A')
+    row = ord(row_letter) - ord("A")
     col = int(col_digits) - 1
     if row < 0 or row >= BOARD_SIZE or col < 0 or col >= BOARD_SIZE:
         raise ValueError("input coordinate out of range（A1-J10）")
     return (row, col)
 
 
-def run_two_player_game(session1: ClientSession, session2: ClientSession, spectators, board1 = None, board2 = None, current_player = 1):
+def run_two_player_game(
+    session1: ClientSession,
+    session2: ClientSession,
+    spectators,
+    board1=None,
+    board2=None,
+    current_player=1,
+):
     """
     Runs a two-player Battleship game.
     Each player has their own board, and they take turns firing at each other's board.
     """
     try:
+
         def broadcast_to_spectators(msg):
+            """
+                Broadcast a message to all spectators.
+
+                Args:
+                    msg (str): The message to be sent to all spectators.
+
+                Logic:
+                    - Iterate through the list of spectators.
+                    - Retrieve each spectator's session from the `sessions` dictionary.
+                    - Send the message to the spectator's session.
+                    - If an error occurs (e.g., spectator disconnected), log an error message.
+            """
             for spectator in spectators:
                 try:
                     session_sp = sessions[spectator]
-                    session_sp.send(msg+'\n')
+                    session_sp.send(msg + "\n")
                 except:
                     print("[ERROR] Failed to send message to spectator")
 
         def send_board(session, board, show_hidden_board=False):
-            grid_to_print = board.hidden_grid if show_hidden_board else board.display_grid
+            """
+                Send the current state of the board to the given session.
+
+                Args:
+                    session (ClientSession): The session to which the board will be sent.
+                    board (Board): The board object containing the game state.
+                    show_hidden_board (bool): If True, send the hidden grid (with ship positions).
+                                              If False, send the display grid (without ship positions).
+
+                Logic:
+                    - Determine which grid to send based on the `show_hidden_board` flag.
+                    - Construct a list of strings representing the board:
+                        - The first line contains column headers (1, 2, ..., N).
+                        - Each subsequent line contains a row label (A, B, ...) followed by the row's contents.
+                    - Send each line of the board to the session.
+            """
+            grid_to_print = (
+                board.hidden_grid if show_hidden_board else board.display_grid
+            )
             grid_data = []
             grid_data.append("GRID")
-            grid_data.append("  " + " ".join(str(i + 1).rjust(2) for i in range(board.size)))
+            grid_data.append(
+                "  " + " ".join(str(i + 1).rjust(2) for i in range(board.size))
+            )
             for r in range(board.size):
-                row_label = chr(ord('A') + r)
+                row_label = chr(ord("A") + r)
                 row_str = " ".join(grid_to_print[r][c] for c in range(board.size))
                 grid_data.append(f"{row_label:2} {row_str}")
             for line in grid_data:
                 session.send(line)
-
-        def recv(session):
-            line = session.recv(1024).decode('utf-8')
-            if not line:  # if client disconnected, raise an exception
-                raise ConnectionError("Client disconnected")
-            line = line.strip()
-            return line
 
         def handle_turn(sess1, opponent_board, sess2, player_name, opponent_name):
             while True:
@@ -328,8 +396,13 @@ def run_two_player_game(session1: ClientSession, session2: ClientSession, specta
                 def read_input():
                     try:
                         send_board(sess1, opponent_board)
-                        sess1.send(f"{player_name}, enter coordinate to fire at (e.g. B5):", use_client_seq=True)
-                        guess = sess1.recv()
+                        sess1.send(
+                            f"{player_name}, enter coordinate to fire at (e.g. B5):",
+                            use_client_seq=True,
+                        )
+                        guess = sess1.recv_buffer.get()
+                        if guess == "CONNECTION_ERROR":
+                            raise ConnectionResetError("Client disconnected")
                         if not timeout_occurred.is_set():  # If timeout has not occurred
                             user_input[0] = guess
                             input_received.set()  # Set input received event
@@ -349,15 +422,23 @@ def run_two_player_game(session1: ClientSession, session2: ClientSession, specta
                     sess1.send("ERROR: out of time，skip the turn.")
                     print(f"[INFO] {player_name} out of time，skip the turn")
                     sess2.send(f"{player_name} out of time，its your turn.")
-                    broadcast_to_spectators(f"[SPECTATOR] {player_name} out of time，skip the turn")
+                    broadcast_to_spectators(
+                        f"[SPECTATOR] {player_name} out of time，skip the turn"
+                    )
                     return True  # proceed to next turn
 
                 # Get the user input
-                guess = user_input[0]
+                try:
+                    guess = user_input[0]
+                except queue.Empty:
+                    print("[INFO] Timeout waiting for user input")
+                    continue
 
                 if guess.lower().startswith("quit"):
-                    sess1.send("Thanks for playing. Goodbye.")
-                    sess2.send(f"opponent player quit the game, Thanks for playing. Goodbye.")
+                    sess1.send("Game quit")
+                    sess2.send(
+                        f"opponent player quit the game."
+                    )
                     print(f"[INFO] {player_name} quit.")
                     return False
 
@@ -370,11 +451,13 @@ def run_two_player_game(session1: ClientSession, session2: ClientSession, specta
                 try:
                     row, col = parse_coordinate(coord_str)
                     result, sunk_name = opponent_board.fire_at(row, col)
-                    if result == 'hit':
+                    if result == "hit":
                         if sunk_name:
                             sess1.send(f"RESULT SINK {sunk_name}")
                             sess2.send(f"RESULT SINK {sunk_name}")
-                            broadcast_to_spectators(f"[SPECTATOR] {player_name} sink {sunk_name}！")
+                            broadcast_to_spectators(
+                                f"[SPECTATOR] {player_name} sink {sunk_name}！"
+                            )
                             print(f"[INFO] {player_name} sink {sunk_name}！")
                         else:
                             sess1.send("RESULT HIT OPPONENT SHIP")
@@ -384,36 +467,43 @@ def run_two_player_game(session1: ClientSession, session2: ClientSession, specta
                         if opponent_board.all_ships_sunk():
                             sess1.send("GAME_OVER You win! All ships sunk!")
                             sess2.send("GAME_OVER You lose! All your ships are sunk!")
-                            broadcast_to_spectators(f"[SPECTATOR] GAME OVER! {player_name} wins!")
+                            broadcast_to_spectators(
+                                f"[SPECTATOR] GAME OVER! {player_name} wins!"
+                            )
                             print(f"[INFO] GAME OVER! {player_name} wins!")
                             return False
-                    elif result == 'miss':
+                    elif result == "miss":
                         sess1.send("RESULT MISS")
                         sess2.send("RESULT MISS")
                         broadcast_to_spectators(f"[SPECTATOR] {player_name} MISS！")
                         print(f"[INFO] {player_name} MISS！")
                 except ValueError:
-                    sess2.send("ERROR: Invalid coordinate")
-                    return True  # request retry
+                    sess1.send("ERROR: Invalid coordinate")
+                    continue  # request retry
 
                 # Update the display grid for the opponent
                 broadcast_to_spectators("GRID")
                 for r in range(opponent_board.size):
-                    row_label = chr(ord('A') + r)
-                    row_str = " ".join(opponent_board.display_grid[r][c] for c in range(opponent_board.size))
+                    row_label = chr(ord("A") + r)
+                    row_str = " ".join(
+                        opponent_board.display_grid[r][c]
+                        for c in range(opponent_board.size)
+                    )
                     broadcast_to_spectators(f"{row_label:2} {row_str}")
                 broadcast_to_spectators("")
 
                 return True  # proceed to next turn
 
         def place_ships_manually(board, session, player_name):
-            session.send(f"{player_name}, place your ships on the board.", use_client_seq=True)
+            session.send(
+                f"{player_name}, place your ships on the board.", use_client_seq=True
+            )
             for ship_name, ship_size in SHIPS:
                 while True:
                     session.send(f"PLACE {ship_name} (size {ship_size})")
                     session.send("FORMAT: PLACE <coord> <H/V>", use_client_seq=True)
                     try:
-                        cmd = session.recv()
+                        cmd = session.recv_buffer.get(timeout=30)
                     except ConnectionError:
                         if session == session1:
                             session2.send("QUIT", use_client_seq=True)
@@ -424,35 +514,61 @@ def run_two_player_game(session1: ClientSession, session2: ClientSession, specta
                             print(f"[INFO] {player_name} quit.")
                             return False
                     if cmd.lower().startswith("quit"):
-                        session.send("Thanks for playing. Goodbye.", use_client_seq=True)
+                        session.send(
+                            "Thanks for playing. Goodbye.", use_client_seq=True
+                        )
                         if session == session1:
-                            session2.send(f"opponent player quit the game, Thanks for playing. Goodbye.", use_client_seq=True)
+                            session2.send(
+                                f"opponent player quit the game, Thanks for playing. Goodbye.",
+                                use_client_seq=True,
+                            )
                         else:
-                            session1.send(f"opponent player quit the game, Thanks for playing. Goodbye.", use_client_seq=True)
+                            session1.send(
+                                f"opponent player quit the game, Thanks for playing. Goodbye.",
+                                use_client_seq=True,
+                            )
                         return False
                     if not cmd.lower().startswith("place "):
-                        session.send("ERROR: Invalid command. Use 'PLACE <coord> <H/V>'", use_client_seq=True)
+                        session.send(
+                            "ERROR: Invalid command. Use 'PLACE <coord> <H/V>'",
+                            use_client_seq=True,
+                        )
                         continue
                     parts = cmd.split()
                     print(parts)
                     if len(parts) != 3:
-                        session.send("ERROR: Invalid format. Example: PLACE A1 H BATTLESHIP", use_client_seq=True)
+                        session.send(
+                            "ERROR: Invalid format. Example: PLACE A1 H BATTLESHIP",
+                            use_client_seq=True,
+                        )
                         continue
                     coord_str, orientation_str = parts[1], parts[2]
                     try:
                         row, col = parse_coordinate(coord_str)
-                        if orientation_str.upper() not in ['H', 'V']:
-                            session.send("ERROR: direction must be 'H' or 'V'", use_client_seq=True)
+                        if orientation_str.upper() not in ["H", "V"]:
+                            session.send(
+                                "ERROR: direction must be 'H' or 'V'",
+                                use_client_seq=True,
+                            )
                             continue
-                        orientation = 0 if orientation_str == 'H' else 1
+                        orientation = 0 if orientation_str == "H" else 1
                         if board.can_place_ship(row, col, ship_size, orientation):
-                            occupied = board.do_place_ship(row, col, ship_size, orientation)
-                            board.placed_ships.append({'name': ship_name, 'positions': occupied})
-                            session.send(f"SUCCESS: {ship_name} placed at {coord_str}", use_client_seq=True)
+                            occupied = board.do_place_ship(
+                                row, col, ship_size, orientation
+                            )
+                            board.placed_ships.append(
+                                {"name": ship_name, "positions": occupied}
+                            )
+                            session.send(
+                                f"SUCCESS: {ship_name} placed at {coord_str}",
+                                use_client_seq=True,
+                            )
                             send_board(session, board, show_hidden_board=True)
                             break
                         else:
-                            session.send("ERROR: Cannot place ship here", use_client_seq=True)
+                            session.send(
+                                "ERROR: Cannot place ship here", use_client_seq=True
+                            )
                     except ValueError as e:
                         session.send(f"ERROR: {e}", use_client_seq=True)
 
