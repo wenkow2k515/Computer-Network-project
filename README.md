@@ -99,7 +99,5 @@ CHAT Hello, players!
 - **Client Connection Issues:**
   - Ensure the server is running before starting clients.
   - Verify firewall settings allow traffic on port 5000.
-- **Input Validation Errors:**
-  - Follow command syntax strictly (e.g., `FIRE A1`, not `fire a1`).
 - **Checksum Errors:**
   - If `Checksum mismatch` appears, the client will automatically request retransmission.
