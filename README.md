@@ -1,4 +1,4 @@
-# BEER: Battleship Multiplayer Game
+# Battleship Multiplayer Game
 
 ## Table of Contents
 - [Project Overview](#project-overview)
