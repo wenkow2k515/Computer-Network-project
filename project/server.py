@@ -89,12 +89,8 @@ def handle_two_player_game(player1_conn, player2_conn):
                     )
 
                     # ask players if they want to play again
-                    session1.send(
-                        "GAME_OVER Play again? (Y/N)", use_client_seq=False
-                    )
-                    session2.send(
-                        "GAME_OVER Play again? (Y/N)", use_client_seq=False
-                    )
+                    session1.send("GAME_OVER Play again? (Y/N)", use_client_seq=False)
+                    session2.send("GAME_OVER Play again? (Y/N)", use_client_seq=False)
                     try:
                         response1 = session1.recv_buffer.get(timeout=60)
                         response2 = session2.recv_buffer.get(timeout=60)
@@ -103,7 +99,9 @@ def handle_two_player_game(player1_conn, player2_conn):
                         break
 
                     if response1 is None or response2 is None:
-                        print("[INFO] One player disconnected during play again prompt.")
+                        print(
+                            "[INFO] One player disconnected during play again prompt."
+                        )
                         break
                     response1 = response1.strip().upper()
                     response2 = response2.strip().upper()
@@ -125,6 +123,7 @@ def handle_two_player_game(player1_conn, player2_conn):
                                 "disconnect_time": time.time(),
                                 "current_player": current_player,
                                 "game_state": "IN_PROGRESS",
+                                "opponent": p2_name if name == p1_name else p1_name,
                             }
                     break
 
@@ -213,6 +212,7 @@ def handle_client(conn, addr):
                 entry = disconnected[username]
                 if time.time() - entry["disconnect_time"] <= 60:
                     print(f"[INFO] {username} reconnected")
+
                     # close the old connection
                     try:
                         entry["conn"].close()
@@ -256,8 +256,75 @@ def handle_client(conn, addr):
         print(f"[ERROR] error in client handling: {e}")
         conn.close()
 
+
+def cleanup_disconnected():
+    """detect disconnected players for 5s and remove them from the game"""
+    while True:
+        with sessions_lock:
+            now = time.time()
+            to_del = []
+            winners = set()  # set to store the winners
+
+            # go through the disconnected players
+            for username, entry in disconnected.items():
+                if now - entry["disconnect_time"] > 60:
+                    to_del.append(username)
+                    opponent_name = entry.get("opponent")
+                    if opponent_name and opponent_name in player_sessions:
+                        winners.add(opponent_name)  # mark the opponent as winner
+
+            # Broadcast the timeout message to the winners
+            for winner in winners:
+                try:
+                    winner_conn = player_sessions[winner]
+                    session = sessions[winner_conn]
+                    session.send("GAME_OVER You win! Opponent timeout!")
+                    # clear the state and remove the player
+                    with players_lock:
+                        if winner_conn in active_players:
+                            active_players.remove(winner_conn)
+                    if winner in player_sessions:
+                        del player_sessions[winner]
+                except Exception as e:
+                    print(f"[ERROR] Cannot show the {winner}: {e}")
+
+            for username in to_del:
+                print(f"[INFO] Clear the timeout player: {username}")
+                del disconnected[username]
+
+                with players_lock:
+                    if len(active_players) < 2 and len(spectators) >= 2:
+                        new_players = []
+                        while len(spectators) > 0 and len(new_players) < 2:
+                            spectator_conn = spectators.pop(0)
+                            try:
+                                session_sp = sessions[spectator_conn]
+                                session_sp.send("PING\n")
+                                active_players.append(spectator_conn)
+                                new_players.append(spectator_conn)
+                                session_sp.send("ROLE PLAYER")
+                                print(
+                                    f"[INFO] the spectator promote to player: {spectator_conn.getpeername()}"
+                                )
+                            except (ConnectionResetError, BrokenPipeError):
+                                continue
+
+                        if len(new_players) == 2:
+                            threading.Thread(
+                                target=handle_two_player_game,
+                                args=(new_players[0], new_players[1]),
+                            ).start()
+
+        time.sleep(5)
+
+
 def main():
     print(f"[INFO] Server listening on {HOST}:{PORT}")
+
+    cleanup_thread = threading.Thread(target=cleanup_disconnected)
+    cleanup_thread.daemon = True
+    cleanup_thread.start()
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((HOST, PORT))
         s.listen(5)

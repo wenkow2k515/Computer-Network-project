@@ -402,6 +402,7 @@ def run_two_player_game(
                         )
                         guess = sess1.recv_buffer.get()
                         if guess == "CONNECTION_ERROR":
+                            sess2.send("oppenent player quit the game, plz quit and trying to reconnect")
                             raise ConnectionResetError("Client disconnected")
                         if not timeout_occurred.is_set():  # If timeout has not occurred
                             user_input[0] = guess
